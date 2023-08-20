@@ -1,12 +1,22 @@
 
 - repo_name: "managed-serviceaccount"
   github_ref: "https://github.com/stolostron/managed-serviceaccount.git"
-  charts:
+  branch: "backplane-2.4"
+  # charts:
+  #   - name: "managed-serviceaccount"
+  #     chart-path: "charts/managed-serviceaccount"
+  #     always-or-toggle: "toggle"
+  #     imageMappings:
+  #       managed-serviceaccount: managed_serviceaccount
+  #     inclusions:
+  #       - "pullSecretOverride"
+  template_addons:
     - name: "managed-serviceaccount"
-      chart-path: "charts/managed-serviceaccount"
+      yaml-paths:
+        - "deploy/bases"
       always-or-toggle: "toggle"
-      branch: "backplane-2.4"
       imageMappings:
         managed-serviceaccount: managed_serviceaccount
-      inclusions:
-        - "pullSecretOverride"
+      escape-template-variables:
+        - "CLUSTER_NAME"
+        - "HUB_KUBECONFIG"

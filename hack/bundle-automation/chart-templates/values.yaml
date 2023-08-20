@@ -9,7 +9,7 @@ global:
   imageOverrides:
     imageOverride: ""
   namespace: default
-    
+
 hubconfig:
   nodeSelector: null
   replicaCount: 1

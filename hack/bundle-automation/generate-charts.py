@@ -64,6 +64,41 @@ def updateClusterRoleBinding(yamlContent):
     for sub in subjectsList:
         sub['namespace'] = '{{ .Values.global.namespace }}'
 
+def updateAddOnTemplate(yamlContent, chartPath, imageKeyMapping):
+    agentSpec = yamlContent['spec']['agentSpec']
+    if 'workload' not in agentSpec:
+        return
+    workload = agentSpec['workload']
+    if 'manifests' not in workload:
+        return
+    manifests = workload['manifests']
+    imageKeys = []
+    for manifest in manifests:
+        if manifest['kind'] == 'Deployment':
+            containers = manifest['spec']['template']['spec']['containers']
+            for container in containers:
+                image_key = parse_image_ref(container['image'])["repository"]
+                try:
+                    image_key = imageKeyMapping[image_key]
+                except KeyError:
+                    logging.critical("No image key mapping provided for imageKey: %s" % image_key)
+                    exit(1)
+                imageKeys.append(image_key)
+                container['image'] = "{{ .Values.global.imageOverrides." + image_key + " }}"
+                # container['imagePullPolicy'] = "{{ .Values.global.pullPolicy }}"
+
+    if len(imageKeys) == 0:
+        return
+    valuesYaml = os.path.join(chartPath, "values.yaml")
+    with open(valuesYaml, 'r') as f:
+        values = yaml.safe_load(f)
+    del  values['global']['imageOverrides']['imageOverride']
+    for imageKey in imageKeys:
+        values['global']['imageOverrides'][imageKey] = "" # set to temp to debug
+    with open(valuesYaml, 'w') as f:
+        yaml.dump(values, f, width=float("inf"))
+    logging.info("Image references and pull policy in deployments and values.yaml updated successfully.\n")
+
 # Copy chart-templates to a new helmchart directory
 def updateResources(outputDir, repo, chart):
     logging.info(" Updating resources!")
@@ -88,7 +123,28 @@ def updateResources(outputDir, repo, chart):
         with open(filePath, 'w') as f:
             yaml.dump(yamlContent, f, width=float("inf"))
 
-
+# updateTemplateAddOnResources updates resources based on the charts config for the template addons
+def updateTemplateAddOnResources(outputDir, repo, template):
+    logging.info(" Updating resources for the template type addons!")
+    # Create main folder
+    always_or_toggle = template['always-or-toggle']
+    chartDir = os.path.join(outputDir, "charts", always_or_toggle, template['name'])
+    templateDir = os.path.join(chartDir, "templates")
+    print(templateDir)
+    for tempFile in os.listdir(templateDir):
+        filePath = os.path.join(templateDir, tempFile)
+        with open(filePath, 'r') as f:
+            yamlContent = yaml.safe_load(f)
+        kind = yamlContent["kind"]
+        if kind == "AddOnTemplate":
+            if 'imageMappings' in template:
+                logging.info(" Updating image mapping for addon template! ''%s", template['name'])
+                updateAddOnTemplate(yamlContent, chartDir, template['imageMappings'])
+        else:
+            logging.info(" No updates for kind %s at this step.", kind)
+            continue
+        with open(filePath, 'w') as f:
+            yaml.dump(yamlContent, f, width=float("inf"))
 
 # Copy chart-templates to a new helmchart directory
 def copyHelmChart(destinationChartPath, repo, chart):
@@ -128,6 +184,36 @@ def copyHelmChart(destinationChartPath, repo, chart):
     shutil.copyfile(os.path.join(chartPath, "values.yaml"), os.path.join(destinationChartPath, "values.yaml"))
     # Copying template values.yaml instead of values.yaml from chart
     shutil.copyfile(os.path.join(os.path.dirname(os.path.realpath(__file__)), "chart-templates", "values.yaml"), os.path.join(destinationChartPath, "values.yaml"))
+
+    logging.info("Chart copied.\n")
+
+# copyTemplateAddOnHelmChart copies yaml files for template type addons to a new helmchart directory
+def copyTemplateAddOnHelmChart(destinationChartPath, repo, template):
+    chartName = template['name']
+    logging.info("Copying templates into new '%s' chart directory ...", chartName)
+
+    destinationTemplateDir = os.path.join(destinationChartPath, "templates")
+    if os.path.exists(destinationTemplateDir):
+        shutil.rmtree(destinationTemplateDir)
+    os.makedirs(destinationTemplateDir)
+
+    for yamlPath in template["yaml-paths"]:
+        chartPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tmp", repo, yamlPath)
+        # Copy Chart.yaml, values.yaml, and templates dir
+
+        for filename in os.listdir(chartPath):
+            if not filename.endswith(".yaml"):
+                continue
+            filepath = os.path.join(chartPath, filename)
+            with open(filepath, 'r') as f:
+                resourceFile = yaml.safe_load(f)
+
+            if resourceFile["kind"] != "CustomResourceDefinition":
+                shutil.copyfile(filepath, os.path.join(destinationTemplateDir, filename))
+
+    # Copying template values.yaml instead of values.yaml from chart
+    shutil.copyfile(os.path.join(os.path.dirname(os.path.realpath(__file__)), "chart-templates", "values.yaml"),
+                     os.path.join(destinationChartPath, "values.yaml"))
 
     logging.info("Chart copied.\n")
 
@@ -459,6 +545,118 @@ def chartConfigAcceptable(chart):
         return False
     return True
 
+def addTemplateAddOnCRDs(repo, template, outputDir):
+    if not 'yaml-paths' in template:
+        logging.critical("Could not validate yaml path in given template: " + template)
+        exit(1)
+
+    for yamlPath in template["yaml-paths"]:
+
+        repoPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tmp", repo, yamlPath)
+        if not os.path.exists(repoPath):
+            logging.critical("Could not validate yaml path at given path: " + repoPath)
+            exit(1)
+
+        destinationPath = os.path.join(outputDir, template['name'], "crds")
+        if os.path.exists(destinationPath): # If path exists, remove and re-clone
+            shutil.rmtree(destinationPath)
+        os.makedirs(destinationPath)
+        for filename in os.listdir(repoPath):
+            if not filename.endswith(".yaml"):
+                continue
+            filepath = os.path.join(repoPath, filename)
+            with open(filepath, 'r') as f:
+                resourceFile = yaml.safe_load(f)
+
+            if resourceFile["kind"] == "CustomResourceDefinition":
+                shutil.copyfile(filepath, os.path.join(destinationPath, filename))
+
+def escapeTemplateVariables(helmChart, variables):
+    addonTemplates = findTemplatesOfType(helmChart, 'AddOnTemplate')
+    for addonTemplate in addonTemplates:
+        for variable in variables:
+            logging.info("Start to escape vriable %s", variable)
+            at = open(addonTemplate, "r")
+            lines = at.readlines()
+            v = "{{"+variable+"}}"
+            for i, line in enumerate(lines):
+                if v in line.strip():
+                    logging.info("Found variable %s in line: %s", v, line.strip())
+                    lines[i] = line.replace(v, "{{ `"+ v + "` }}")
+
+            a_file = open(addonTemplate, "w")
+            a_file.writelines(lines)
+            a_file.close()
+    logging.info("Escaped template variables.\n")
+
+def generateHelmCharts(destination, skipOverrides, repo):
+    # Loop through each operator in the repo identified by the config
+    for chart in repo["charts"]:
+        if not chartConfigAcceptable(chart):
+            logging.critical(
+                "Unable to generate helm chart without configuration requirements."
+            )
+            exit(1)
+
+        logging.info("Helm Chartifying -  %s!\n", chart["name"])
+
+        logging.info("Adding CRDs -  %s!\n", chart["name"])
+        # Copy over all CRDs to the destination directory
+        addCRDs(repo["repo_name"], chart, destination)
+
+        logging.info("Creating helm chart: '%s' ...", chart["name"])
+
+        always_or_toggle = chart["always-or-toggle"]
+        destinationChartPath = os.path.join(
+            destination, "charts", always_or_toggle, chart["name"]
+        )
+
+        # Template Helm Chart Directory from 'chart-templates'
+        logging.info("Templating helm chart '%s' ...", chart["name"])
+        copyHelmChart(destinationChartPath, repo["repo_name"], chart)
+
+        updateResources(destination, repo["repo_name"], chart)
+
+        if not skipOverrides:
+            logging.info("Adding Overrides (set --skipOverrides=true to skip) ...")
+            exclusions = chart["exclusions"] if "exclusions" in chart else []
+            inclusions = chart["inclusions"] if "inclusions" in chart else []
+            injectRequirements(
+                destinationChartPath,
+                chart["name"],
+                chart["imageMappings"],
+                exclusions,
+                inclusions,
+            )
+            logging.info("Overrides added. \n")
+
+def generateTemplateAddOnYamls(destination, skipOverrides, repo):
+    for template in repo["template_addons"]:
+        logging.info("Adding template: '%s' ...", template["name"])
+
+        logging.info("Adding CRDs -  %s!\n", template["name"])
+        # Copy over all CRDs to the destination directory
+        addTemplateAddOnCRDs(repo["repo_name"], template, destination)
+
+        logging.info("Creating helm chart: '%s' ...", template["name"])
+
+        always_or_toggle = template["always-or-toggle"]
+        destinationChartPath = os.path.join(
+            destination, "charts", always_or_toggle, template["name"]
+        )
+
+        # Template Helm Chart Directory from 'chart-templates'
+        logging.info("Templating helm chart '%s' ...", template["name"])
+        copyTemplateAddOnHelmChart(destinationChartPath, repo["repo_name"], template)
+
+        logging.info("Updating resources for template type addons: '%s' ...", template["name"])
+        updateTemplateAddOnResources(destination, repo["repo_name"], template)
+
+        if len(template["escape-template-variables"]) > 0:
+            logging.info("Start to escape template variables %s for '%s'\n", template["name"],
+                          template["escape-template-variables"])
+            escapeTemplateVariables(destinationChartPath, template["escape-template-variables"])
+
 def main():
     ## Initialize ArgParser
     parser = argparse.ArgumentParser()
@@ -492,37 +690,20 @@ def main():
             shutil.rmtree(repo_path)
         repository = Repo.clone_from(repo["github_ref"], repo_path) # Clone repo to above path
         if 'branch' in repo:
+            logging.info("Checkout to branch %s -  %s!\n",repo['branch'], repo["repo_name"])
             repository.git.checkout(repo['branch']) # If a branch is specified, checkout that branch
-        
-        # Loop through each operator in the repo identified by the config
-        for chart in repo["charts"]:
-            if not chartConfigAcceptable(chart):
-                logging.critical("Unable to generate helm chart without configuration requirements.")
-                exit(1)
 
-            logging.info("Helm Chartifying -  %s!\n", chart["name"])
+        if 'charts' not in repo and 'template_addons' not in repo:
+            logging.critical("Unable to generate helm chart without charts or template addons.")
+            exit(1)
 
-            logging.info("Adding CRDs -  %s!\n", chart["name"])
-            # Copy over all CRDs to the destination directory
-            addCRDs(repo["repo_name"], chart, destination)
+        if 'charts' in repo:
+            # Loop through each operator in the repo identified by the config
+            generateHelmCharts(destination, skipOverrides, repo)
 
-            logging.info("Creating helm chart: '%s' ...", chart["name"])
+        if 'template_addons' in repo:
+            generateTemplateAddOnYamls(destination, skipOverrides, repo)
 
-            always_or_toggle = chart['always-or-toggle']
-            destinationChartPath = os.path.join(destination, "charts", always_or_toggle, chart['name'])
-
-            # Template Helm Chart Directory from 'chart-templates'
-            logging.info("Templating helm chart '%s' ...", chart["name"])
-            copyHelmChart(destinationChartPath, repo["repo_name"], chart)
-
-            updateResources(destination, repo["repo_name"], chart)
-
-            if not skipOverrides:
-                logging.info("Adding Overrides (set --skipOverrides=true to skip) ...")
-                exclusions = chart["exclusions"] if "exclusions" in chart else []
-                inclusions = chart["inclusions"] if "inclusions" in chart else []
-                injectRequirements(destinationChartPath, chart["name"], chart["imageMappings"], exclusions, inclusions)
-                logging.info("Overrides added. \n")
 
 if __name__ == "__main__":
    main()
